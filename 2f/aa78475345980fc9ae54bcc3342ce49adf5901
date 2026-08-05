@@ -1,0 +1,38 @@
+packages/core/sdk/src/executor.ts
+  s_d1faa6ac7b8c0e::t_765403f2a2e167 182-190
+  s_d1faa6ac7b8c0e::t_c7938de846af2d 177-181,191-200,1625,1762
+packages/core/sdk/src/oauth-flow.test.ts
+  s_d82257917460c6::t_bb19d70b5660a4 17,825-871,873-885,888-889
+  s_d82257917460c6::t_f7dd87cf537fec 886-887
+  s_d82257917460c6::t_b4919351360484 872
+  s_d1faa6ac7b8c0e::t_51f287332fd4f3 890-893
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.21",
+  "base_commit_sha": "2faa78475345980fc9ae54bcc3342ce49adf5901",
+  "prompts": {},
+  "humans": {
+    "h_0e3d6b6eb02b89": {
+      "author": "Rishit Sharma <rishitsharmar89@gmail.com>"
+    }
+  },
+  "sessions": {
+    "s_d1faa6ac7b8c0e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "609ace51-c613-4f92-94fa-c7f9e03c7a27",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Rishit Sharma <rishitsharmar89@gmail.com>"
+    },
+    "s_d82257917460c6": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fd07e-ac2c-7793-b27e-841bcb900cf3",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "Rishit Sharma <rishitsharmar89@gmail.com>"
+    }
+  }
+}
