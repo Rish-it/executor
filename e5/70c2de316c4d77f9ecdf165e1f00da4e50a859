@@ -1,0 +1,33 @@
+e2e/selfhost/oauth-refresh-cross-session.test.ts
+  s_d82257917460c6::t_f7dd87cf537fec 230-232
+  s_d82257917460c6::t_cc8fa531db6ad0 130-146,206-207
+  s_d82257917460c6::t_9421c0e8363f68 19,50
+  s_d82257917460c6::t_1ffe1cd0e10e9c 18,20-49,51-53,64-129,147-157,159-205,208-229,233-239,243-262
+  s_d82257917460c6::t_9c8710258cf9e1 54-63,158,240-242
+  s_d82257917460c6::t_142cb513deefba 15-17
+  s_d1faa6ac7b8c0e::t_b72dd16cd8c221 1-14
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.21",
+  "base_commit_sha": "e570c2de316c4d77f9ecdf165e1f00da4e50a859",
+  "prompts": {},
+  "sessions": {
+    "s_d1faa6ac7b8c0e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "609ace51-c613-4f92-94fa-c7f9e03c7a27",
+        "model": "unknown"
+      },
+      "human_author": "Rishit Sharma <rishitsharmar89@gmail.com>"
+    },
+    "s_d82257917460c6": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fd07e-ac2c-7793-b27e-841bcb900cf3",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "Rishit Sharma <rishitsharmar89@gmail.com>"
+    }
+  }
+}
