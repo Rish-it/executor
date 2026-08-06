@@ -1,0 +1,22 @@
+packages/core/sdk/src/executor.ts
+  s_d1faa6ac7b8c0e::t_96de6728b1e798 1,2076-2090,2092-2096
+packages/core/sdk/src/oauth-flow.test.ts
+  s_d1faa6ac7b8c0e::t_96de6728b1e798 2,957-1040
+  s_d1faa6ac7b8c0e::t_aa08be5fd69762 1041-1044
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.21",
+  "base_commit_sha": "8474b3f5f4bf2a9273803b24b20f9e93edb54cb2",
+  "prompts": {},
+  "sessions": {
+    "s_d1faa6ac7b8c0e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "609ace51-c613-4f92-94fa-c7f9e03c7a27",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Rishit Sharma <rishitsharmar89@gmail.com>"
+    }
+  }
+}
