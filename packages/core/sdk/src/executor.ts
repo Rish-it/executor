@@ -1969,9 +1969,13 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
     // every execution stack over one DB handle, so it spans tenants too:
     // without it, two tenants whose rows agree on owner/subject/integration/
     // name would collide on one entry and one tenant's caller could be handed
-    // the other's access token.
+    // the other's access token. JSON.stringify keeps the components
+    // unambiguous: tenant, subject, integration, and name are opaque strings
+    // that may contain any delimiter, so a delimiter-joined key would let
+    // tenant "a" + subject "user:b" collide with tenant "a:user" + subject
+    // "b" — the same cross-tenant bleed by another route.
     const connectionKey = (row: ConnectionRow): string =>
-      `${tenant}:${row.owner}:${row.subject}:${row.integration}:${row.name}`;
+      JSON.stringify([tenant, row.owner, row.subject, row.integration, row.name]);
 
     const loadOAuthClientRow = (
       owner: Owner,

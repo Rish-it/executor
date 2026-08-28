@@ -9,6 +9,8 @@ import {
   OAuthClientSlug,
   OAuthState,
   ProviderKey,
+  Subject,
+  Tenant,
   ToolAddress,
   ToolName,
 } from "./ids";
@@ -1034,6 +1036,141 @@ describe("oauth token refresh in resolveConnectionValue", () => {
         expect(
           refreshGrantsIn(yield* server.requests),
           "one refresh grant for the connection, not one per execution stack",
+        ).toHaveLength(1);
+      }),
+    ),
+  );
+
+  // The gate spans tenants (one map per root DB handle), so its key must keep
+  // tenant and subject unambiguous. Both are opaque strings that may contain
+  // any delimiter: under a colon-joined key, tenant "a" + subject "user:b" and
+  // tenant "a:user" + subject "b" both flatten to "a:user:user:b:…", so two
+  // DIFFERENT tenants' refreshes would share one gate entry and one tenant's
+  // caller would be handed the other tenant's access token.
+  it.effect("colliding tenant/subject pairs never share a refresh gate entry", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const serverA = yield* serveOAuthTestServer({ scopes: ["read"] });
+        const serverB = yield* serveOAuthTestServer({ scopes: ["read"] });
+        const parkA = makeTokenRequestPark();
+        const parkB = makeTokenRequestPark();
+
+        // ONE root DB handle under TWO tenants — the shape a multi-tenant host
+        // holds — so both executors share one refresh gate. `shared.db` stays
+        // bound to tenant A's owner-policy context; tenant B's row edits below
+        // build their own scoped handle by hand. Each tenant gets its OWN
+        // credential store instance: the memory store keys items without a
+        // tenant, so sharing one across tenants would cross their tokens at
+        // the store layer and mask the gate-key collision this test is about.
+        const pluginsA = [memoryCredentialsPlugin(), oauthPlugin] as const;
+        const pluginsB = [memoryCredentialsPlugin(), oauthPlugin] as const;
+        const shared = makeTestConfig({ plugins: pluginsA, tenant: "a", subject: "user:b" });
+        const configA = { ...shared, fetch: parkA.fetch };
+        const configB = {
+          ...shared,
+          plugins: pluginsB,
+          tenant: Tenant.make("a:user"),
+          subject: Subject.make("b"),
+          fetch: parkB.fetch,
+        };
+        const sessionA = yield* createExecutor(configA);
+        const sessionB = yield* createExecutor(configB);
+        yield* Effect.addFinalizer(() => sessionA.close().pipe(Effect.ignore));
+        yield* Effect.addFinalizer(() => sessionB.close().pipe(Effect.ignore));
+        yield* Effect.addFinalizer(() =>
+          Effect.promise(() => shared.testDb.close()).pipe(Effect.ignore),
+        );
+
+        // Each tenant mints its own USER-owned connection (user rows carry the
+        // session subject, which is what the colliding pair needs) against its
+        // own authorization server, so token provenance is observable.
+        const connect = (session: typeof sessionA, server: typeof serverA) =>
+          Effect.gen(function* () {
+            yield* session.acme.seed();
+            yield* session.oauth.createClient({
+              owner: "org",
+              slug: CLIENT,
+              authorizationUrl: server.authorizationEndpoint,
+              tokenUrl: server.tokenEndpoint,
+              grant: "authorization_code",
+              clientId: "test-client",
+              clientSecret: "test-secret",
+            });
+            const started = yield* session.oauth.start({
+              owner: "user",
+              client: CLIENT,
+              clientOwner: "org",
+              name: ConnectionName.make("mine"),
+              integration: INTEG,
+              template: TEMPLATE,
+            });
+            expect(started.status).toBe("redirect");
+            if (started.status !== "redirect") return;
+            const callback = yield* server.completeAuthorizationCodeFlow({
+              authorizationUrl: started.authorizationUrl,
+            });
+            yield* session.oauth.complete({ state: started.state, code: callback.code });
+          });
+        yield* connect(sessionA, serverA);
+        yield* connect(sessionB, serverB);
+
+        const address = ToolAddress.make("tools.acme.user.mine.whoami");
+        const originalA = (yield* sessionA.execute(address, {})) as { token: string };
+        const originalB = (yield* sessionB.execute(address, {})) as { token: string };
+        expect(originalB.token).not.toBe(originalA.token);
+
+        // Expire BOTH rows so both tenants must refresh. `shared.db` is bound
+        // to tenant A; tenant B's partition needs its own scoped handle.
+        const dbB = withQueryContext(shared.testDb.db, { tenant: "a:user", subject: "b" });
+        yield* Effect.promise(() =>
+          shared.db.updateMany("connection", {
+            where: (b) => b("name", "=", "mine"),
+            set: { expires_at: Date.now() - 60_000 },
+          }),
+        );
+        yield* Effect.promise(() =>
+          dbB.updateMany("connection", {
+            where: (b) => b("name", "=", "mine"),
+            set: { expires_at: Date.now() - 60_000 },
+          }),
+        );
+
+        parkA.arm();
+        parkB.arm();
+        const first = yield* Effect.forkChild(sessionA.execute(address, {}));
+        // Hold tenant A's grant open so its gate entry is still registered
+        // when tenant B performs its lookup of the would-be colliding key.
+        yield* Effect.promise(() => parkA.seen);
+        const second = yield* Effect.forkChild(sessionB.execute(address, {}));
+        // With a collision-free key, tenant B misses the gate and sends its
+        // OWN grant. Under a colliding key it would await tenant A's deferred
+        // and never reach its server, so cap the wait with a real timer (the
+        // test clock is virtual, so Effect.sleep would never fire) instead of
+        // hanging the suite; the assertions below then report the bleed.
+        yield* Effect.promise(() =>
+          Promise.race([parkB.seen, new Promise((resolve) => setTimeout(resolve, 2_000))]),
+        );
+        parkA.release();
+        parkB.release();
+
+        const tokenA = (yield* Fiber.join(first)) as { token: string };
+        const tokenB = (yield* Fiber.join(second)) as { token: string };
+
+        expect(tokenA.token, "tenant A refreshed to a new token").not.toBe(originalA.token);
+        expect(tokenB.token, "tenant B refreshed to a new token").not.toBe(originalB.token);
+        expect(tokenB.token, "no cross-tenant token bleed").not.toBe(tokenA.token);
+        expect(yield* serverA.acceptsAccessToken(tokenA.token)).toBe(true);
+        expect(
+          yield* serverB.acceptsAccessToken(tokenB.token),
+          "tenant B's token was minted by tenant B's own authorization server",
+        ).toBe(true);
+        expect(
+          refreshGrantsIn(yield* serverA.requests),
+          "tenant A ran its own refresh grant",
+        ).toHaveLength(1);
+        expect(
+          refreshGrantsIn(yield* serverB.requests),
+          "tenant B ran its own refresh grant — two distinct refresh executions",
         ).toHaveLength(1);
       }),
     ),
