@@ -1,20 +1,21 @@
 // Selfhost-only: two MCP sessions that hit an expired token at the same moment
 // must share ONE refresh-token grant, never race two.
 //
-// Issue #1520: the in-flight refresh gate lived inside a single scoped
-// executor, but the self-host builds a fresh scoped executor per MCP session,
-// so each session believed it was the refresh winner and redeemed the same
-// stored refresh token. Providers that rotate refresh tokens answer the second
+// Issue #1520: the in-flight refresh gate lived inside a single execution
+// stack, but the self-host builds a fresh stack per MCP session, so each
+// session believed it was the refresh winner and redeemed the same stored
+// refresh token. Providers that rotate refresh tokens answer the second
 // redemption with `invalid_grant: refresh token reuse detected` and may revoke
 // the whole token family — the connection dies and the user must reauthorize.
 // The first refresh cycle succeeds, so the bug stays invisible until a later
 // expiry.
 //
 // The journey: an OpenAPI integration completes a real authorization-code flow
-// against a live test AS, the upstream then rejects both sessions' first call
-// with a 401 at the same instant (it holds both requests until both arrive), and
-// the AS's own request ledger proves exactly one refresh grant was issued and
-// both retries carried the same new bearer.
+// against a live test authorization server; the upstream then rejects both
+// sessions' first call with a 401 at the same instant (it holds both requests
+// until both have arrived, so the contention is forced rather than left to the
+// scheduler); and the authorization server's own request ledger proves exactly
+// one refresh grant was issued and both retries carried the same new bearer.
 import { randomBytes } from "node:crypto";
 import { createServer, type ServerResponse } from "node:http";
 
@@ -37,26 +38,36 @@ const api = composePluginApi([openApiHttpPlugin()] as const);
 
 const unique = (prefix: string) => `${prefix}_${randomBytes(4).toString("hex")}`;
 
+/** Both sessions call once, are rejected together, then retry once. */
+const SESSIONS = 2;
+
 type UpstreamHandle = {
   readonly url: string;
   readonly bearers: () => readonly string[];
   readonly close: () => void;
 };
 
+/**
+ * Upstream that rejects the whole first wave at once.
+ *
+ * The barrier is the point: it holds every session's first call until all have
+ * arrived, then 401s them together, which forces both sessions into a genuinely
+ * simultaneous refresh instead of hoping the scheduler interleaves them.
+ */
 const serveUpstream = () =>
   Effect.acquireRelease(
     Effect.callback<UpstreamHandle>((resume) => {
       const bearers: string[] = [];
-      const initialResponses: ServerResponse[] = [];
+      const held: ServerResponse[] = [];
       const server = createServer((request, response) => {
         if (request.method === "GET" && (request.url ?? "").startsWith("/issues")) {
           bearers.push((request.headers.authorization ?? "").replace(/^Bearer\s+/i, ""));
-          if (initialResponses.length < 2) {
-            initialResponses.push(response);
-            if (initialResponses.length === 2) {
-              for (const initialResponse of initialResponses) {
-                initialResponse.writeHead(401, { "content-type": "application/json" });
-                initialResponse.end(JSON.stringify({ error: "invalid_token" }));
+          if (held.length < SESSIONS) {
+            held.push(response);
+            if (held.length === SESSIONS) {
+              for (const rejected of held) {
+                rejected.writeHead(401, { "content-type": "application/json" });
+                rejected.end(JSON.stringify({ error: "invalid_token" }));
               }
             }
             return;
@@ -131,17 +142,15 @@ const completeAuthorization = (authorizationUrl: string) =>
   Effect.promise(async () => {
     const authorize = await fetch(authorizationUrl, { redirect: "manual" });
     const loginUrl = authorize.headers.get("location");
-    if (!loginUrl) throw new Error(`authorize did not redirect: ${authorize.status}`);
+    if (!loginUrl) return null;
     const login = await fetch(loginUrl, {
       method: "POST",
       headers: { authorization: `Basic ${Buffer.from("alice:password").toString("base64")}` },
       redirect: "manual",
     });
     const callbackUrl = login.headers.get("location");
-    if (!callbackUrl) throw new Error(`login did not redirect: ${login.status}`);
-    const code = new URL(callbackUrl).searchParams.get("code");
-    if (!code) throw new Error("callback carried no authorization code");
-    return code;
+    if (!callbackUrl) return null;
+    return new URL(callbackUrl).searchParams.get("code");
   });
 
 scenario(
@@ -204,6 +213,8 @@ scenario(
           );
           if (started.status !== "redirect") return yield* Effect.die("no redirect");
           const code = yield* completeAuthorization(started.authorizationUrl);
+          expect(code, "the authorization server issued a callback code").toBeDefined();
+          if (code == null) return yield* Effect.die("no authorization code");
           yield* client.oauth.complete({ payload: { state: started.state, code } });
 
           const address = (yield* client.tools.list({ query: {} }))
@@ -214,9 +225,8 @@ scenario(
           if (!address) return yield* Effect.die("no listIssues tool");
           yield* oauth.clearRequests;
 
-          const firstSession = mcp.session(identity);
-          const secondSession = mcp.session(identity);
-          const call = (session: typeof firstSession) =>
+          const sessions = Array.from({ length: SESSIONS }, () => mcp.session(identity));
+          const call = (session: (typeof sessions)[number]) =>
             Effect.gen(function* () {
               let result = yield* session.call("execute", { code: invokeByAddressCode(address) });
               let approvals = 0;
@@ -224,12 +234,13 @@ scenario(
                 result = yield* session.approvePaused(result.text);
                 approvals += 1;
               }
+              // Without a shared gate the loser redeems a retired refresh token
+              // and the authorization server answers invalid_grant, so this is
+              // the assertion that carries the user-visible failure.
               expect(result.ok, `MCP execute completed: ${result.text.slice(0, 400)}`).toBe(true);
             });
 
-          yield* Effect.all([call(firstSession), call(secondSession)], {
-            concurrency: "unbounded",
-          });
+          yield* Effect.all(sessions.map(call), { concurrency: "unbounded" });
 
           const refreshGrants = (yield* oauth.requests).filter(
             (request) =>
@@ -237,7 +248,9 @@ scenario(
           );
           expect(refreshGrants, "both sessions joined one refresh grant").toHaveLength(1);
           const bearers = upstream.bearers();
-          expect(bearers, "both rejected calls retried after the refresh").toHaveLength(4);
+          expect(bearers, "both rejected calls retried after the refresh").toHaveLength(
+            SESSIONS * 2,
+          );
           expect(bearers[2], "the first retry used a new bearer").not.toBe(bearers[0]);
           expect(bearers[3], "both retries used the refreshed bearer").toBe(bearers[2]);
         }),

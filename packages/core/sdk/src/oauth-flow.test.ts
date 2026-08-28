@@ -1,5 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Effect, Exit, Fiber, Predicate } from "effect";
+import { Deferred, Effect, Fiber, Predicate } from "effect";
+import { withQueryContext } from "@executor-js/fumadb/query";
 
 import {
   AuthTemplateSlug,
@@ -7,16 +8,18 @@ import {
   IntegrationSlug,
   OAuthClientSlug,
   OAuthState,
+  ProviderKey,
   ToolAddress,
   ToolName,
 } from "./ids";
 import { authToolFailure } from "./auth-tool-failure";
+import { createExecutor } from "./executor";
 import { decodeOAuthCallbackState } from "./oauth";
 import { OAuthStartError } from "./oauth-client";
 import { missingGrantedOAuthScopes } from "./oauth-service";
-import { createExecutor } from "./executor";
 import { definePlugin } from "./plugin";
-import { makeTestWorkspaceHarness, memoryCredentialsPlugin } from "./test-config";
+import type { CredentialProvider } from "./provider";
+import { makeTestConfig, makeTestWorkspaceHarness, memoryCredentialsPlugin } from "./test-config";
 import { ToolResult } from "./tool-result";
 import { serveOAuthTestServer } from "./testing/oauth-test-server";
 
@@ -65,6 +68,69 @@ const oauthPlugin = definePlugin(() => ({
 }))();
 
 const plugins = [memoryCredentialsPlugin(), oauthPlugin] as const;
+
+// Stated explicitly where a test builds a SECOND root database handle by hand:
+// both handles must carry the same owner-policy context to address one
+// connection, so the values cannot be left to `makeTestConfig`'s defaults.
+const SHARED_STORE_TENANT = "test-tenant";
+const SHARED_STORE_SUBJECT = "test-subject";
+
+/** The URL a `fetch` double was handed, however the caller spelled it. */
+const fetchTarget = (input: Parameters<typeof globalThis.fetch>[0]): string =>
+  typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+
+/**
+ * A `fetch` that holds token-endpoint requests open AFTER the authorization
+ * server has answered them.
+ *
+ * Parking after the response is the point. The refresh token has been rotated
+ * upstream by then, and the in-flight gate entry is still registered, so a peer
+ * arriving during the park has to resolve against an OPEN grant rather than a
+ * settled one. Parking before the response would prove nothing: the grant would
+ * never reach the server, and a peer that went on to run its own grant would
+ * find the stored token still live and succeed.
+ *
+ * Idle until `arm()`, so connection setup (the authorization-code exchange)
+ * runs through untouched.
+ */
+const makeTokenRequestPark = () => {
+  let armed = false;
+  let onSeen: (() => void) | null = null;
+  const seen = new Promise<void>((resolve) => {
+    onSeen = resolve;
+  });
+  let onRelease: (() => void) | null = null;
+  const parked = new Promise<void>((resolve) => {
+    onRelease = resolve;
+  });
+  // oxlint-disable-next-line executor/no-raw-fetch -- test boundary: the park wraps the platform fetch and must delegate back to it, which is the only seam that can hold a token request open mid-grant.
+  const platformFetch: typeof globalThis.fetch = globalThis.fetch;
+  const fetch: typeof globalThis.fetch = async (input, init) => {
+    const response = await platformFetch(input, init);
+    if (armed && new URL(fetchTarget(input)).pathname === "/token") {
+      onSeen?.();
+      await parked;
+    }
+    return response;
+  };
+  return {
+    fetch,
+    arm: () => {
+      armed = true;
+    },
+    /** Resolves once a token request has been answered and is being held. */
+    seen,
+    release: () => onRelease?.(),
+  };
+};
+
+/** Every refresh-token grant the authorization server was asked for. */
+const refreshGrantsIn = (
+  requests: ReadonlyArray<{ readonly path: string; readonly body: string }>,
+) =>
+  requests.filter(
+    (request) => request.path === "/token" && request.body.includes("grant_type=refresh_token"),
+  );
 
 interface TokenEndpointCall {
   readonly host: string;
@@ -885,15 +951,33 @@ describe("oauth token refresh in resolveConnectionValue", () => {
     ),
   );
 
-  it.effect("shares one refresh grant across executor stacks for the same connection", () =>
+  // Issue #1520, in one process. A self-host builds a FRESH execution stack per
+  // MCP session over ONE database handle, so two sessions resolving the same
+  // connection each read the same stored refresh token and each believe they
+  // are the refresh winner. The authorization server rotates that token, so the
+  // loser redeems one the winner already spent, and a server that detects reuse
+  // revokes the whole family: the connection dies and the user must
+  // reauthorize. The first refresh always succeeds, which is why the fault
+  // stays invisible until a later expiry.
+  it.effect("two execution stacks over one host database share a single refresh grant", () =>
     Effect.scoped(
       Effect.gen(function* () {
         const server = yield* serveOAuthTestServer({ scopes: ["read"] });
-        const harness = yield* makeTestWorkspaceHarness({ plugins });
-        const { executor, config } = harness;
-        yield* executor.acme.seed();
+        const park = makeTokenRequestPark();
 
-        yield* executor.oauth.createClient({
+        // One database handle and one credential store under two execution
+        // stacks — what a self-host holds while two MCP sessions are open.
+        const config = { ...makeTestConfig({ plugins }), fetch: park.fetch };
+        const sessionA = yield* createExecutor(config);
+        const sessionB = yield* createExecutor(config);
+        yield* Effect.addFinalizer(() => sessionA.close().pipe(Effect.ignore));
+        yield* Effect.addFinalizer(() => sessionB.close().pipe(Effect.ignore));
+        yield* Effect.addFinalizer(() =>
+          Effect.promise(() => config.testDb.close()).pipe(Effect.ignore),
+        );
+
+        yield* sessionA.acme.seed();
+        yield* sessionA.oauth.createClient({
           owner: "org",
           slug: CLIENT,
           authorizationUrl: server.authorizationEndpoint,
@@ -901,10 +985,8 @@ describe("oauth token refresh in resolveConnectionValue", () => {
           grant: "authorization_code",
           clientId: "test-client",
           clientSecret: "test-secret",
-          resource: server.mcpResourceUrl,
         });
-
-        const started = yield* executor.oauth.start({
+        const started = yield* sessionA.oauth.start({
           owner: "org",
           client: CLIENT,
           clientOwner: "org",
@@ -917,12 +999,12 @@ describe("oauth token refresh in resolveConnectionValue", () => {
         const callback = yield* server.completeAuthorizationCodeFlow({
           authorizationUrl: started.authorizationUrl,
         });
-        yield* executor.oauth.complete({ state: started.state, code: callback.code });
+        yield* sessionA.oauth.complete({ state: started.state, code: callback.code });
 
-        const original = (yield* executor.execute(
-          ToolAddress.make("tools.acme.org.main.whoami"),
-          {},
-        )) as { token: string };
+        const address = ToolAddress.make("tools.acme.org.main.whoami");
+        const original = (yield* sessionA.execute(address, {})) as { token: string };
+
+        // Expire the access token so BOTH stacks must refresh.
         yield* Effect.promise(() =>
           config.db.updateMany("connection", {
             where: (b) => b("name", "=", "main"),
@@ -930,39 +1012,58 @@ describe("oauth token refresh in resolveConnectionValue", () => {
           }),
         );
         yield* server.clearRequests;
+        park.arm();
 
-        const peer = yield* createExecutor(config);
-        yield* Effect.addFinalizer(() => peer.close().pipe(Effect.ignore));
-        const [first, second] = yield* Effect.all(
-          [
-            executor.execute(ToolAddress.make("tools.acme.org.main.whoami"), {}),
-            peer.execute(ToolAddress.make("tools.acme.org.main.whoami"), {}),
-          ],
-          { concurrency: "unbounded" },
-        );
+        const first = yield* Effect.forkChild(sessionA.execute(address, {}));
+        const second = yield* Effect.forkChild(sessionB.execute(address, {}));
+        // Release only once a grant has been answered and is being held open,
+        // so the peer resolves against a grant that is still in flight. Without
+        // the park the peer could arrive after the winner had already settled,
+        // find a fresh token, refresh nothing, and pass this test for the wrong
+        // reason.
+        yield* Effect.promise(() => park.seen);
+        park.release();
 
-        const firstToken = (first as { token: string }).token;
-        const secondToken = (second as { token: string }).token;
-        expect(firstToken).not.toBe(original.token);
-        expect(secondToken).toBe(firstToken);
-        const refreshGrants = (yield* server.requests).filter(
-          (request) =>
-            request.path === "/token" && request.body.includes("grant_type=refresh_token"),
+        const firstToken = (yield* Fiber.join(first)) as { token: string };
+        const secondToken = (yield* Fiber.join(second)) as { token: string };
+
+        expect(firstToken.token, "the refresh minted a new access token").not.toBe(original.token);
+        expect(secondToken.token, "both stacks resolved the SAME refreshed token").toBe(
+          firstToken.token,
         );
-        expect(refreshGrants).toHaveLength(1);
+        expect(
+          refreshGrantsIn(yield* server.requests),
+          "one refresh grant for the connection, not one per execution stack",
+        ).toHaveLength(1);
       }),
     ),
   );
 
-  it.effect("a joined stack survives the owning stack being interrupted mid-refresh", () =>
+  // The gate entry is shared, so the stack that REGISTERS a grant is only the
+  // first arrival, not its owner. Running the grant on that caller's fiber
+  // would hand it that caller's interruption — a disconnected MCP client, an
+  // execution deadline, a cancelled tool call — and abandon a refresh token the
+  // authorization server has ALREADY rotated. What the store still holds is
+  // then dead, and the next grant is answered invalid_grant: the interruption
+  // would have killed the connection. So the grant runs detached, and callers
+  // only await it.
+  it.effect("an interrupted first arrival still settles the grant and persists its token", () =>
     Effect.scoped(
       Effect.gen(function* () {
         const server = yield* serveOAuthTestServer({ scopes: ["read"] });
-        const harness = yield* makeTestWorkspaceHarness({ plugins });
-        const { executor, config } = harness;
-        yield* executor.acme.seed();
+        const park = makeTokenRequestPark();
 
-        yield* executor.oauth.createClient({
+        const config = { ...makeTestConfig({ plugins }), fetch: park.fetch };
+        const sessionA = yield* createExecutor(config);
+        const sessionB = yield* createExecutor(config);
+        yield* Effect.addFinalizer(() => sessionA.close().pipe(Effect.ignore));
+        yield* Effect.addFinalizer(() => sessionB.close().pipe(Effect.ignore));
+        yield* Effect.addFinalizer(() =>
+          Effect.promise(() => config.testDb.close()).pipe(Effect.ignore),
+        );
+
+        yield* sessionA.acme.seed();
+        yield* sessionA.oauth.createClient({
           owner: "org",
           slug: CLIENT,
           authorizationUrl: server.authorizationEndpoint,
@@ -970,9 +1071,8 @@ describe("oauth token refresh in resolveConnectionValue", () => {
           grant: "authorization_code",
           clientId: "test-client",
           clientSecret: "test-secret",
-          resource: server.mcpResourceUrl,
         });
-        const started = yield* executor.oauth.start({
+        const started = yield* sessionA.oauth.start({
           owner: "org",
           client: CLIENT,
           clientOwner: "org",
@@ -985,61 +1085,236 @@ describe("oauth token refresh in resolveConnectionValue", () => {
         const callback = yield* server.completeAuthorizationCodeFlow({
           authorizationUrl: started.authorizationUrl,
         });
-        yield* executor.oauth.complete({ state: started.state, code: callback.code });
+        yield* sessionA.oauth.complete({ state: started.state, code: callback.code });
 
         const address = ToolAddress.make("tools.acme.org.main.whoami");
-        yield* executor.execute(address, {});
+        const original = (yield* sessionA.execute(address, {})) as { token: string };
         yield* Effect.promise(() =>
           config.db.updateMany("connection", {
             where: (b) => b("name", "=", "main"),
             set: { expires_at: Date.now() - 60_000 },
           }),
         );
+        yield* server.clearRequests;
+        park.arm();
 
-        // Park the owning stack inside the token request so the second stack
-        // has a window to join the in-flight grant before the interrupt lands.
-        let release: (() => void) | null = null;
-        const parked = new Promise<void>((resolve) => {
-          release = resolve;
-        });
-        let sawTokenRequest = false;
-        // oxlint-disable-next-line executor/no-raw-fetch -- test seam: this wrapper replaces the platform fetch and must delegate back to it once unparked
-        const passthrough: typeof globalThis.fetch = globalThis.fetch;
-        const parkingFetch: typeof globalThis.fetch = async (input, init) => {
-          if (String(input).includes("/token")) {
-            sawTokenRequest = true;
-            await parked;
-          }
-          return passthrough(input, init);
-        };
+        // The first arrival registers the grant, and its session drops the
+        // instant the authorization server has rotated the token — the worst
+        // possible moment, and the one a disconnecting MCP client picks.
+        const arrival = yield* Effect.forkChild(Effect.exit(sessionA.execute(address, {})));
+        yield* Effect.promise(() => park.seen);
+        yield* Fiber.interrupt(arrival);
+        park.release();
 
-        const owner = yield* createExecutor({ ...config, fetch: parkingFetch });
-        const joiner = yield* createExecutor(config);
-        yield* Effect.addFinalizer(() => owner.close().pipe(Effect.ignore));
-        yield* Effect.addFinalizer(() => joiner.close().pipe(Effect.ignore));
-
-        const outcome = yield* Effect.promise(async () => {
-          const ownerFiber = Effect.runFork(owner.execute(address, {}));
-          for (let attempt = 0; attempt < 300 && !sawTokenRequest; attempt += 1) {
+        // That the grant finishes at all, with nobody left waiting on it, is
+        // the property under test: a rotated token that is never persisted is a
+        // dead connection.
+        const persisted = yield* Effect.promise(async () => {
+          for (let attempt = 0; attempt < 500; attempt += 1) {
+            const row = await config.db.findFirst("connection", {
+              where: (b) => b("name", "=", "main"),
+            });
+            const expiresAt = row?.expires_at;
+            if (expiresAt != null && Number(expiresAt) > Date.now()) return true;
             await new Promise((resolve) => setTimeout(resolve, 10));
           }
-          const joined = Effect.runPromise(Effect.exit(joiner.execute(address, {})));
-          await new Promise((resolve) => setTimeout(resolve, 200));
-          // The owning stack's MCP client disconnects mid-refresh. Its
-          // interruption only lands once the shared grant settles, so unpark the
-          // token request rather than awaiting the interrupt first.
-          const interrupted = Effect.runPromise(Fiber.interrupt(ownerFiber));
-          release?.();
-          await interrupted;
-          return await joined;
+          return false;
         });
+        expect(persisted, "the detached grant settled and persisted its rotated token").toBe(true);
 
-        expect(sawTokenRequest).toBe(true);
-        expect(Exit.isSuccess(outcome), "the joined stack completed on the shared grant").toBe(
-          true,
+        const recovered = (yield* sessionB.execute(address, {})) as { token: string };
+        expect(recovered.token, "the peer stack resolved the rotated token").not.toBe(
+          original.token,
         );
+        expect(
+          yield* server.acceptsAccessToken(recovered.token),
+          "and the authorization server still honours it",
+        ).toBe(true);
+        expect(
+          refreshGrantsIn(yield* server.requests),
+          "the interrupted arrival's grant settled, so no second grant was needed",
+        ).toHaveLength(1);
       }),
     ),
+  );
+
+  // Two product instances, one connection, one credential store. The in-flight
+  // refresh gate serialises refreshes across every execution stack over ONE
+  // root database handle and cannot see past it, so between two INSTANCES —
+  // two replicas, two isolates — nothing but the store itself stands between
+  // two refreshers and the same rotated token. The provider below opens a seam
+  // exactly where the danger is — between the read of the stored refresh token
+  // and whatever the reader writes next — because a probe that "tests" the
+  // store by rewriting the value it just read would put the spent token back
+  // over the peer's rotated one, and kill the connection it was added to
+  // protect.
+  it.effect(
+    "a refresher paused after reading the stored token never writes it back over a peer's rotated one",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const server = yield* serveOAuthTestServer({ scopes: ["read"] });
+
+          const store = new Map<string, string>();
+          // Every item id written, in order — the tape that says WHICH item a
+          // refresher touched, which is the whole question here.
+          const writes: string[] = [];
+          const pausedAtRead = yield* Deferred.make<void>();
+          const resumeFromRead = yield* Deferred.make<void>();
+          // One-shot: the FIRST read of a refresh token stops there; the
+          // peer's read, moments later, runs straight through.
+          let pauseNextRefreshRead = false;
+
+          const sharedStore: CredentialProvider = {
+            key: ProviderKey.make("shared-memory"),
+            writable: true,
+            get: (id) =>
+              Effect.gen(function* () {
+                const value = store.get(String(id)) ?? null;
+                if (pauseNextRefreshRead && String(id).endsWith(":refresh")) {
+                  pauseNextRefreshRead = false;
+                  yield* Deferred.succeed(pausedAtRead, undefined);
+                  yield* Deferred.await(resumeFromRead);
+                }
+                return value;
+              }),
+            set: (id, value) =>
+              Effect.sync(() => {
+                writes.push(String(id));
+                store.set(String(id), value);
+              }),
+            delete: (id) => Effect.sync(() => void store.delete(String(id))),
+          };
+
+          // One database and one credential store, two executors over them —
+          // the deployment this race needs and the one a single harness
+          // cannot express.
+          //
+          // Each executor gets its OWN root database handle onto that one
+          // database, because that handle is what identifies an instance: the
+          // in-flight refresh gate is shared per handle, so two executors over
+          // the SAME handle are two execution stacks in one instance and the
+          // second would simply join the first's grant — closing the very
+          // window this test exists to open. A second replica holds a second
+          // handle, which is what the extra `withQueryContext` wrapper is.
+          const config = {
+            ...makeTestConfig({
+              plugins: [oauthPlugin] as const,
+              tenant: SHARED_STORE_TENANT,
+              subject: SHARED_STORE_SUBJECT,
+            }),
+            providers: [sharedStore],
+          };
+          const instanceA = yield* createExecutor(config);
+          const instanceB = yield* createExecutor({
+            ...config,
+            db: withQueryContext(config.testDb.db, {
+              tenant: SHARED_STORE_TENANT,
+              subject: SHARED_STORE_SUBJECT,
+            }),
+          });
+          yield* Effect.addFinalizer(() =>
+            Effect.promise(() => config.testDb.close()).pipe(Effect.ignore),
+          );
+          yield* Effect.addFinalizer(() => instanceA.close().pipe(Effect.ignore));
+          yield* Effect.addFinalizer(() => instanceB.close().pipe(Effect.ignore));
+
+          yield* instanceA.acme.seed();
+          yield* instanceA.oauth.createClient({
+            owner: "org",
+            slug: CLIENT,
+            authorizationUrl: server.authorizationEndpoint,
+            tokenUrl: server.tokenEndpoint,
+            grant: "authorization_code",
+            clientId: "test-client",
+            clientSecret: "test-secret",
+          });
+          const started = yield* instanceA.oauth.start({
+            owner: "org",
+            client: CLIENT,
+            clientOwner: "org",
+            name: ConnectionName.make("main"),
+            integration: INTEG,
+            template: TEMPLATE,
+          });
+          expect(started.status).toBe("redirect");
+          if (started.status !== "redirect") return;
+          const callback = yield* server.completeAuthorizationCodeFlow({
+            authorizationUrl: started.authorizationUrl,
+          });
+          yield* instanceA.oauth.complete({ state: started.state, code: callback.code });
+
+          const refreshItemId = [...store.keys()].find((key) => key.endsWith(":refresh"));
+          expect(refreshItemId, "the completed connection stored a refresh token").toBeDefined();
+          const spentRefreshToken = store.get(refreshItemId!);
+
+          // Expire the access token so both instances must refresh.
+          yield* Effect.promise(() =>
+            config.db.updateMany("connection", {
+              where: (b) => b("name", "=", "main"),
+              set: { expires_at: Date.now() - 60_000 },
+            }),
+          );
+
+          // A begins a refresh and stops the instant it has the stored refresh
+          // token in hand. This is the window.
+          pauseNextRefreshRead = true;
+          const refresherA = yield* Effect.forkChild(
+            Effect.exit(instanceA.execute(ToolAddress.make("tools.acme.org.main.whoami"), {})),
+          );
+          yield* Deferred.await(pausedAtRead);
+
+          // B refreshes on that same token, to completion. The authorization
+          // server rotates it, so what the store holds afterwards is the only
+          // value left that can ever mint again.
+          yield* instanceB.execute(ToolAddress.make("tools.acme.org.main.whoami"), {});
+          const rotatedByB = store.get(refreshItemId!);
+          expect(rotatedByB, "the peer's refresh rotated the stored token").not.toBe(
+            spentRefreshToken,
+          );
+          const writesBeforeAResumes = writes.length;
+
+          // A resumes into a world where the token it is holding is already
+          // spent — and still has to prove the store is writable before it
+          // tries to spend it.
+          yield* Deferred.succeed(resumeFromRead, undefined);
+          yield* Fiber.join(refresherA);
+
+          expect(
+            store.get(refreshItemId!),
+            "the peer's rotated refresh token is still what the store holds",
+          ).toBe(rotatedByB);
+          expect(
+            [...store.entries()]
+              .filter(([, value]) => value === spentRefreshToken)
+              .map(([key]) => key),
+            "the spent refresh token was not written back anywhere",
+          ).toEqual([]);
+
+          // The gate did still run for A — on an item of its own, holding no
+          // credential. Its grant then failed on the spent token, so it
+          // persisted nothing: this one write is everything A wrote.
+          const writtenByA = writes.slice(writesBeforeAResumes);
+          expect(writtenByA, "the resumed refresher wrote exactly one item").toHaveLength(1);
+          expect(writtenByA[0], "and it was not the refresh token's own item").not.toBe(
+            refreshItemId,
+          );
+          expect(
+            [spentRefreshToken, rotatedByB],
+            "the item it wrote carries no credential",
+          ).not.toContain(store.get(writtenByA[0]!));
+
+          // Both instances really did reach the authorization server, so the
+          // interleaving under test happened rather than being short-circuited.
+          expect(
+            (yield* server.requests).filter(
+              (request) =>
+                request.path === "/token" && request.body.includes("grant_type=refresh_token"),
+            ),
+            "both instances sent a refresh grant",
+          ).toHaveLength(2);
+        }),
+      ),
   );
 
   it.effect(
