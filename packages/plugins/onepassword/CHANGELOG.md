@@ -1,5 +1,14 @@
 # @executor-js/plugin-onepassword
 
+## 1.6.9
+
+### Patch Changes
+
+- Updated dependencies [[`cc0fd8f`](https://github.com/UsefulSoftwareCo/executor/commit/cc0fd8f6099f3d05c73a285ef14932c01ac212fa)]:
+  - @executor-js/sdk@1.6.9
+  - @executor-js/api@1.4.72
+  - @executor-js/react@1.4.72
+
 ## 1.6.8
 
 ### Patch Changes

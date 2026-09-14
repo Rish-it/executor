@@ -1,5 +1,17 @@
 # @executor-js/plugin-openapi
 
+## 1.6.9
+
+### Patch Changes
+
+- [#1937](https://github.com/UsefulSoftwareCo/executor/pull/1937) [`e9055c1`](https://github.com/UsefulSoftwareCo/executor/commit/e9055c13bf73bc1860c8eded542fe566b51c3784) Thanks [@The-AarushiSingh](https://github.com/The-AarushiSingh)! - Preserve vendor +json Content-Type on OpenAPI object request bodies.
+
+- Updated dependencies [[`cc0fd8f`](https://github.com/UsefulSoftwareCo/executor/commit/cc0fd8f6099f3d05c73a285ef14932c01ac212fa)]:
+  - @executor-js/sdk@1.6.9
+  - @executor-js/api@1.4.72
+  - @executor-js/config@1.6.9
+  - @executor-js/react@1.4.72
+
 ## 1.6.8
 
 ### Patch Changes

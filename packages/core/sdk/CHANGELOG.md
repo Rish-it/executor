@@ -1,5 +1,11 @@
 # @executor-js/sdk
 
+## 1.6.9
+
+### Patch Changes
+
+- [#1982](https://github.com/UsefulSoftwareCo/executor/pull/1982) [`cc0fd8f`](https://github.com/UsefulSoftwareCo/executor/commit/cc0fd8f6099f3d05c73a285ef14932c01ac212fa) Thanks [@mmarabel](https://github.com/mmarabel)! - Retry a refresh-token grant without `scope` when the authorization server refuses the echoed grant with `invalid_scope`. Railway answers a scope-bearing refresh with "refresh token missing requested scope" even though echoing the granted scope is legal under RFC 6749 §6, so a connection whose refresh token was still live failed every call as `oauth_refresh_failed` and only a hand re-authorization recovered it.
+
 ## 1.6.8
 
 ### Patch Changes

@@ -1,5 +1,17 @@
 # @executor-js/e2e
 
+## 0.0.49
+
+### Patch Changes
+
+- Updated dependencies [[`e9055c1`](https://github.com/UsefulSoftwareCo/executor/commit/e9055c13bf73bc1860c8eded542fe566b51c3784), [`cc0fd8f`](https://github.com/UsefulSoftwareCo/executor/commit/cc0fd8f6099f3d05c73a285ef14932c01ac212fa)]:
+  - @executor-js/plugin-openapi@1.6.9
+  - @executor-js/sdk@1.6.9
+  - @executor-js/api@1.4.72
+  - @executor-js/plugin-graphql@1.6.9
+  - @executor-js/plugin-mcp@1.6.9
+  - @executor-js/plugin-toolkits@1.5.44
+
 ## 0.0.48
 
 ### Patch Changes
